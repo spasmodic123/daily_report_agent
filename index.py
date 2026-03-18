@@ -1,3 +1,4 @@
+from sqlalchemy import false
 import requests
 import datetime
 import time
@@ -17,28 +18,113 @@ APP_ID = settings.APP_ID
 # QWEN_MODEL = "qwen-max"                # 负责排版与校验的基础模型
 DING_ACCESS_TOKEN = settings.DING_ACCESS_TOKEN
 DING_SECRET = settings.DING_SECRET
+TAVILY_API_KEY = settings.TAVILY_API_KEY
+
+from tavily import TavilyClient
+import concurrent.futures
+
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 # =================================================
 
 
-def call_search_agent(prompt, api_key, app_id):
-    """Stage 1: 调用百炼 Agent 仅进行联网搜索和事实提取"""
-    url = f"https://dashscope.aliyuncs.com/api/v1/apps/{app_id}/completion"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    data = {
-        "input": {"prompt": prompt},
-        "parameters": {
-            "temperature": 0.5,  # 极低温度，确保不发散
-            "top_p": 0.5,
-            "enable_thinking": True,
-        },
-    }
+def call_tavily_search(yesterday, today):
+    """Stage 1: Tavily 联网搜索（硬白名单约束）"""
+    # 官方 AI 实验室域名组
+    official_sites = [
+        "openai.com",
+        "anthropic.com",
+        "deepmind.google",
+        "blog.google",
+        "ai.meta.com",
+        "mistral.ai",
+        "blogs.nvidia.com",
+        "huggingface.co/blog",
+    ]
+    # 主流媒体域名组
+    media_sites = [
+        "theinformation.com",
+        "techcrunch.com",
+        "technologyreview.com",
+        "wired.com",
+        "bloomberg.com",
+        "reuters.com",
+        "therundown.ai",
+    ]
 
-    response = requests.post(url, headers=headers, json=data, timeout=300)
-    response.raise_for_status()
-    return response.json().get("output", {}).get("text", "")
+    queries = [
+        {
+            "q": f"{yesterday} AInews AI model announcement release",
+            "domains": official_sites,
+        },
+        {"q": f"{yesterday} AI news breakthrough", "domains": media_sites},
+    ]
+
+    def _search(item):
+        try:
+            return tavily_client.search(
+                query=item["q"],
+                include_domains=item["domains"],
+                max_results=8,
+                search_depth="advanced",
+                start_date=yesterday,
+                end_date=today,
+            ).get("results", [])
+        except Exception as e:
+            print(f"Tavily search error: {e}")
+            return []
+
+    all_results = []
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        for res in pool.map(_search, queries):
+            all_results.extend(res)
+
+    # 去重
+    seen_urls = set()
+    unique_results = []
+    for r in all_results:
+        url = r.get("url")
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            unique_results.append(r)
+
+    # 按 score 排序
+    unique_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return unique_results
+
+
+def call_tavily_extract(search_results, top_n=10):
+    """Stage 2: Tavily 深度抓取正文（突破反爬）"""
+    if not search_results:
+        return []
+
+    urls = [r["url"] for r in search_results[:top_n]]
+    try:
+        resp = tavily_client.extract(urls=urls, extract_depth="advanced")
+        return resp.get("results", [])
+    except Exception as e:
+        print(f"Tavily extract error: {e}")
+        return []
+
+
+# def call_search_agent(prompt, api_key, app_id):
+#     """Stage 1: 调用百炼 Agent 仅进行联网搜索和事实提取"""
+#     url = f"https://dashscope.aliyuncs.com/api/v1/apps/{app_id}/completion"
+#     headers = {
+#         "Authorization": f"Bearer {api_key}",
+#         "Content-Type": "application/json",
+#     }
+#     data = {
+#         "input": {"prompt": prompt},
+#         "parameters": {
+#             "temperature": 0.5,  # 极低温度，确保不发散
+#             "top_p": 0.5,
+#             "enable_thinking": True,
+#         },
+#     }
+
+#     response = requests.post(url, headers=headers, json=data, timeout=300)
+#     response.raise_for_status()
+#     return response.json().get("output", {}).get("text", "")
 
 
 def call_writer_llm(prompt, api_key, app_id):
@@ -50,7 +136,7 @@ def call_writer_llm(prompt, api_key, app_id):
     }
     data = {
         "input": {"prompt": prompt},
-        "parameters": {"temperature": 0.5, "top_p": 0.5, "enable_thinking": True},
+        "parameters": {"temperature": 0.5, "top_p": 0.5, "enable_thinking": False},
     }
 
     response = requests.post(url, headers=headers, json=data, timeout=120)
@@ -90,69 +176,70 @@ def handler():
     print(f"=== 首席分析师启动: {today_full} {weekday_str} ===", flush=True)
 
     # ---------------------------------------------------------
-    # Prompt 1: 猎犬模式 (专注事实检索，放弃排版)
-    #   ★ Query 工程化：强制模型对官方源和主流媒体使用 site: 限定词
+    # Stage 1: Tavily 联网搜索（白名单硬约束）
     # ---------------------------------------------------------
+    print("--> 正在执行 Stage 1: Tavily 联网搜索...", flush=True)
+    search_results = call_tavily_search(yesterday_full, today_full)
+    print(f"  [Tavily Search] 找到 {len(search_results)} 条候选链接", flush=True)
 
-    # 官方 AI 实验室域名组（权重最高）
-    official_sites = (
-        "site:openai.com OR site:anthropic.com OR site:deepmind.google "
-        "OR site:blog.google OR site:ai.meta.com OR site:mistral.ai "
-        "OR site:blogs.nvidia.com OR site:huggingface.co OR site:groq.com"
-    )
-    # 主流科技媒体域名组
-    media_sites = (
-        "site:techcrunch.com OR site:theverge.com OR site:technologyreview.com "
-        "OR site:wired.com OR site:bloomberg.com OR site:reuters.com "
-        "OR site:theinformation.com OR site:therundown.ai"
-    )
+    if not search_results:
+        return {"status": "error", "msg": "Tavily Search 未返回任何结果"}
 
-    search_prompt = f"""
-    任务：网络检索 {yesterday_full} 至 {today_full} 期间发生的全球 AI 行业重大动态。
+    # ---------------------------------------------------------
+    # Stage 2: Tavily 深度全文提取（突破反爬）
+    # ---------------------------------------------------------
+    print("--> 正在执行 Stage 2: Tavily 提取全文...", flush=True)
+    extracted_pages = call_tavily_extract(search_results, top_n=10)
+    print(f"  [Tavily Extract] 成功提取 {len(extracted_pages)} 个页面全文", flush=True)
 
-    搜索策略（必须严格执行三组搜索）
+    if not extracted_pages:
+        return {"status": "error", "msg": "Tavily Extract 提取全文失败"}
 
-    【搜索组 A - 官方首发优先】
-    搜索词："{yesterday_full} AI announcement {official_sites}"
-    目标：抓取各大 AI 实验室的官方公告、模型发布、研究论文。
+    # 将提取的页面组装成完整上下文
+    pages_context = ""
+    for idx, page in enumerate(extracted_pages):
+        pages_context += f"【页面 {idx+1}】\nURL: {page.get('url')}\n正文内容：\n{page.get('raw_content', page.get('content', ''))}\n\n\n"
 
-    【搜索组 B - 主流媒体报道】
-    搜索词："{yesterday_full} AI news {media_sites}"
-    目标：抓取权威科技媒体对 AI 行业的深度报道和独家爆料。
+    # ---------------------------------------------------------
+    # Stage 3: Qwen 结构化提炼 (精读全文)
+    # ---------------------------------------------------------
+    extract_prompt = f"""
+    任务：详细阅读以下网页全文内容，提炼 {yesterday_full} 至 {today_full} 期间全球 AI 行业重大动态事实。
 
-    【搜索组 C - 通用补充】
-    搜索词："{yesterday_full} AI breakthrough model release"
-    目标：补充前两组遗漏的重要事件，必须附带完整来源 URL。
+    网页全文内容如下：
+    <pages>
+    {pages_context}
+    </pages>
 
-    每条资讯的输出格式（严格遵循）：
+    请对网页信息提取核心事实部分，每一条资讯的输出格式（严格遵循）：
     - 事件名称：
-    - 事件描述：（详细描述发生了什么）
+    - 事件描述：（基于页面正文内容，详细描述发生了什么）
     - 发布/发生日期：
     - 核心功能点：
-    - 官方数据指标：（若无则写"未提及"）
-    - 来源 URL：（必填，粘贴完整可访问的 URL）
+    - 官方数据指标：（若正文无数据请写"未提及"）
+    - 来源 URL：（必填，使用页面原本的 URL）
 
     规则：
-    1. 你是一个无情的资料收集机器，直接输出资讯列表，不需要开场白。
-    2. 绝对诚实：没有找到的维度请直接写"未提及"，严禁编造任何数据或 URL。
-    3. 每条来源 URL 必须真实可访问，不允许虚构 URL。
+    1. 你是一个无情的资料提取机器，直接提取资料不要进行任何加工。
+    2. 绝对诚实：没有找到的维度请直接写"未提及"，严禁编造任何数据。
+    3. 如果多个页面讲同一件事，请合并提取为一条资讯。
     """
 
     try:
-        print("--> 正在执行 Stage 1: 联网搜集事实碎片（Query 工程化模式）...", flush=True)
-        raw_facts = call_search_agent(search_prompt, API_KEY, APP_ID)
+        print("--> 正在执行 Stage 3: Qwen 结构化提炼...", flush=True)
+        raw_facts = call_writer_llm(extract_prompt, API_KEY, APP_ID)
 
-        print('---------------------------------------------------------\n\n')
+        print("---------------------------------------------------------\n\n")
         print(raw_facts)
-        print('---------------------------------------------------------\n\n')
+        print("---------------------------------------------------------\n\n")
 
         if not raw_facts:
-            return {"status": "error", "msg": "Search Agent 返回为空"}
+            return {"status": "error", "msg": "LLM 提炼返回为空"}
 
         # ---------------------------------------------------------
-        # Stage 2: Python 域名白名单硬过滤（确定性工程约束）
+        # Stage 4: Python 域名白名单硬过滤（安全冗余约束）
         # ---------------------------------------------------------
-        print("--> 正在执行 Stage 2: 域名白名单过滤...", flush=True)
+        print("--> 正在执行 Stage 4: 域名白名单过滤...", flush=True)
         filtered_facts, filter_stats = filter_sources(raw_facts)
 
         print(
@@ -174,7 +261,7 @@ def handler():
             filtered_facts = raw_facts
 
         # ---------------------------------------------------------
-        # Prompt 3: 审稿模式 (严格校验事实，执行格式化)
+        # Stage 5: 审稿模式 (严格校验事实，执行排版)
         #   ★ 输入素材已经过域名白名单过滤，来源均为官方/主流媒体
         # ---------------------------------------------------------
 
@@ -207,12 +294,12 @@ def handler():
         </facts>
         """
 
-        print("--> 正在执行 Stage 3: 事实校验与深度排版...", flush=True)
+        print("--> 正在执行 Stage 5: 事实校验与深度排版...", flush=True)
         final_report = call_writer_llm(writer_prompt, API_KEY, APP_ID)
 
-        print('---------------------------------------------------------\n\n')
+        print("---------------------------------------------------------\n\n")
         print(final_report)
-        print('---------------------------------------------------------\n\n')
+        print("---------------------------------------------------------\n\n")
 
         # C. 优化手机端展示（保留了你的呼吸感排版逻辑作为最终兜底）
         lines = [l.strip() for l in final_report.split("\n") if l.strip()]
@@ -243,5 +330,5 @@ def handler():
         print(f"❌ 系统崩溃: {str(e)}")
         return {"status": "error", "msg": str(e)}
 
-handler()
 
+handler()

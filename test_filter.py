@@ -2,7 +2,9 @@
 test_filter.py — source_filter 单元测试脚本
 运行方式：cd /Users/wuboxiong/Desktop/learn/daily_report_agent && python /tmp/test_filter.py
 """
+
 import sys
+
 sys.path.insert(0, "/Users/wuboxiong/Desktop/learn/daily_report_agent")
 
 from source_filter import get_domain_score, filter_sources
@@ -13,15 +15,15 @@ print("【测试 1】get_domain_score 评分测试")
 print("=" * 50)
 
 cases = [
-    ("https://openai.com/blog/gpt-5",           10,   "✅ 白名单-精确匹配"),
-    ("https://blog.openai.com/new-model",        10,   "✅ 白名单-子域名匹配"),
-    ("https://techcrunch.com/2024/ai-news",       8,   "✅ 媒体白名单"),
-    ("https://huggingface.co/papers/xxxx",        9,   "✅ HuggingFace"),
-    ("https://zhihu.com/p/123456",              -100,  "❌ 黑名单-知乎"),
-    ("https://toutiao.com/group/xxx",           -100,  "❌ 黑名单-头条"),
-    ("https://mp.weixin.qq.com/s/abc",          -100,  "❌ 黑名单-微信"),
-    ("https://example.com/some-ai-post",           0,  "⚪ 未知域名-中性"),
-    ("https://www.reuters.com/technology/ai",      8,  "✅ www. 前缀正确剥离"),
+    ("https://openai.com/blog/gpt-5", 10, "✅ 白名单-精确匹配"),
+    ("https://blog.openai.com/new-model", 10, "✅ 白名单-子域名匹配"),
+    ("https://techcrunch.com/2024/ai-news", 8, "✅ 媒体白名单"),
+    ("https://huggingface.co/papers/xxxx", 9, "✅ HuggingFace"),
+    ("https://zhihu.com/p/123456", -100, "❌ 黑名单-知乎"),
+    ("https://toutiao.com/group/xxx", -100, "❌ 黑名单-头条"),
+    ("https://mp.weixin.qq.com/s/abc", -100, "❌ 黑名单-微信"),
+    ("https://example.com/some-ai-post", 0, "⚪ 未知域名-中性"),
+    ("https://www.reuters.com/technology/ai", 8, "✅ www. 前缀正确剥离"),
 ]
 
 all_pass = True

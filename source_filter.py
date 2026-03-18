@@ -32,7 +32,7 @@ WHITELIST_DOMAINS: dict[str, int] = {
     "blogs.nvidia.com": 9,
     "developer.nvidia.com": 9,
     "huggingface.co": 9,
-    "microsoft.com": 8,          # 含 /en-us/research 等子路径
+    "microsoft.com": 8,  # 含 /en-us/research 等子路径
     # ---- 主流科技与商业媒体 ----
     "theinformation.com": 9,
     "techcrunch.com": 8,
@@ -59,7 +59,7 @@ WHITELIST_DOMAINS: dict[str, int] = {
 # 2. 黑名单域名（低质量自媒体/聚合站，直接剔除）
 # ===========================================================
 BLACKLIST_DOMAINS: set[str] = {
-    # 国内自媒体 / 聚合站 
+    # 国内自媒体 / 聚合站
     "weixin.qq.com",
     "mp.weixin.qq.com",
     "juejin.cn",
@@ -70,15 +70,15 @@ BLACKLIST_DOMAINS: set[str] = {
     "infoq.cn",
     "36kr.com",
     "leiphone.com",
-    "jiqizhixin.com",       # 国内二手转载为主
-    "sohu.com", 
+    "jiqizhixin.com",  # 国内二手转载为主
+    "sohu.com",
     "sina.com.cn",
     "163.com",
     "qq.com",
     "baidu.com",
     # 境外低质量聚合站
-    "medium.com",           # 质量参差不齐，需谨慎（可按需移至白名单）
-    "substack.com",         # 个人 Newsletter，可按需移至白名单
+    "medium.com",  # 质量参差不齐，需谨慎（可按需移至白名单）
+    "substack.com",  # 个人 Newsletter，可按需移至白名单
     "reddit.com",
     "twitter.com",
     "x.com",
@@ -183,7 +183,13 @@ def filter_sources(raw_text: str) -> tuple[str, dict]:
             - removed_domains: 被剔除的域名列表
     """
     if not raw_text or not raw_text.strip():
-        return raw_text, {"total": 0, "kept": 0, "removed": 0, "no_url": 0, "removed_domains": []}
+        return raw_text, {
+            "total": 0,
+            "kept": 0,
+            "removed": 0,
+            "no_url": 0,
+            "removed_domains": [],
+        }
 
     # 按连续空行分割为段落
     paragraphs = re.split(r"\n\s*\n", raw_text.strip())
@@ -207,7 +213,9 @@ def filter_sources(raw_text: str) -> tuple[str, dict]:
                 d = _extract_domain(u)
                 if d and d not in removed_domains:
                     removed_domains.append(d)
-            print(f"  [过滤器] ❌ 已剔除段落（来源: {[_extract_domain(u) for u in urls]}）")
+            print(
+                f"  [过滤器] ❌ 已剔除段落（来源: {[_extract_domain(u) for u in urls]}）"
+            )
         else:
             if not urls:
                 no_url_count += 1

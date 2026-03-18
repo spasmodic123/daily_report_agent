@@ -21,6 +21,7 @@ class ApplicationSettings(BaseSettings):
     QWEN_MODEL: str = config("QWEN_MODEL")
     DING_ACCESS_TOKEN: str = config("DING_ACCESS_TOKEN")
     DING_SECRET: str = config("DING_SECRET")
+    TAVILY_API_KEY: str = config("TAVILY_API_KEY")
 
 
 class Settings(
