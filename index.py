@@ -46,9 +46,9 @@ def call_tavily_search(yesterday, today):
         "techcrunch.com",
         "technologyreview.com",
         "wired.com",
-        "bloomberg.com",
         "reuters.com",
-        "therundown.ai",
+        "36kr.com",
+        "aibase.cn",
     ]
 
     queries = [
@@ -56,7 +56,7 @@ def call_tavily_search(yesterday, today):
             "q": f"{yesterday} AInews AI model announcement release",
             "domains": official_sites,
         },
-        {"q": f"{yesterday} AI news breakthrough", "domains": media_sites},
+        {"q": f"{yesterday} AI news 人工智能", "domains": media_sites},
     ]
 
     def _search(item):
@@ -172,6 +172,7 @@ def handler():
     weekday_str = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][
         now.weekday()
     ]
+    today_minute = now.strftime("%m-%d-%H:%M:%S")
 
     print(f"=== 首席分析师启动: {today_full} {weekday_str} ===", flush=True)
 
@@ -195,10 +196,86 @@ def handler():
     if not extracted_pages:
         return {"status": "error", "msg": "Tavily Extract 提取全文失败"}
 
-    # 将提取的页面组装成完整上下文
+    # 将提取的页面组装成完整上下文(RAW)
     pages_context = ""
     for idx, page in enumerate(extracted_pages):
         pages_context += f"【页面 {idx+1}】\nURL: {page.get('url')}\n正文内容：\n{page.get('raw_content', page.get('content', ''))}\n\n\n"
+
+    # ---------------------------------------------------------
+    # Stage 2.5: 使用基础模型清洗页面内容噪声 (Base64, SVG, 导航栏等)
+    # ---------------------------------------------------------
+    print("--> 正在执行 Stage 2.5: 大模型智能清洗页面噪声数据...", flush=True)
+
+    def _clean_page(idx, page):
+        url = page.get("url")
+        raw_content = page.get("raw_content", page.get("content", ""))
+
+        # 兜底截断，防止单页面极大撑爆接口
+        if len(raw_content) > 40000:
+            raw_content = raw_content[:40000] + "\n...(因过长截断)"
+
+        # 使用兼容 OpenAI 接口调用廉价基础模型，例如 qwen-plus
+        clean_prompt = f"任务：清理以下网页的垃圾噪声。去除所有长篇幅的 base64 编码图片、无用 svg/html 样式代码、页脚导航栏等干扰。\n只保留真正有用的新闻报道正文、技术说明、引述等纯文本内容。\n请直接输出清理后的干净正文，不要输出多余格式或者前置提示：\n\n{raw_content}"
+
+        api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        }
+        data = {
+            "model": "qwen3.5-flash",
+            "messages": [{"role": "user", "content": clean_prompt}],
+            "temperature": 0.5,
+        }
+
+        try:
+            resp = requests.post(api_url, headers=headers, json=data, timeout=120)
+            resp.raise_for_status()
+            cleaned_content = (
+                resp.json()
+                .get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            if not cleaned_content.strip():
+                cleaned_content = raw_content
+        except Exception as e:
+            print(f"  [警告] 页面 {idx+1} 清洗失败: {e}", flush=True)
+            cleaned_content = raw_content
+
+        return f"【页面 {idx+1}】\nURL: {url}\n正文内容（已清洗）：\n{cleaned_content}\n\n\n"
+
+    # 并发执行清洗
+    cleaned_pages_context_list = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        # 保持顺序
+        results = pool.map(
+            lambda enum: _clean_page(enum[0], enum[1]), enumerate(extracted_pages)
+        )
+        cleaned_pages_context_list = list(results)
+
+    cleaned_pages_context = "".join(cleaned_pages_context_list)
+
+    # 将清洗前与清洗后的结果分别保存到本地以便调试查看对比
+    try:
+        with open(
+            f"extract_result/extracted_pages_debug_raw_{today_minute}.txt",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            f.write(pages_context)
+        with open(
+            f"extract_result/extracted_pages_debug_cleaned_{today_minute}.txt",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            f.write(cleaned_pages_context)
+        print(
+            f"  [Debug] 页面抓取与清洗结果已对比保存至 extract_result/extracted_pages_debug_raw/cleaned_{today_minute}.txt",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"  [Debug] 保存抓取结果失败: {e}", flush=True)
 
     # ---------------------------------------------------------
     # Stage 3: Qwen 结构化提炼 (精读全文)
@@ -208,7 +285,7 @@ def handler():
 
     网页全文内容如下：
     <pages>
-    {pages_context}
+    {cleaned_pages_context}
     </pages>
 
     请对网页信息提取核心事实部分，每一条资讯的输出格式（严格遵循）：
@@ -230,7 +307,7 @@ def handler():
         raw_facts = call_writer_llm(extract_prompt, API_KEY, APP_ID)
 
         print("---------------------------------------------------------\n\n")
-        print(raw_facts)
+        print("raw_facts: \n", raw_facts)
         print("---------------------------------------------------------\n\n")
 
         if not raw_facts:
@@ -267,28 +344,29 @@ def handler():
 
         writer_prompt = f"""
         # Role
-        你是一个极度克制、追求“高价值密度”的 AI 行业资深参谋。你的任务是将杂乱的搜索素材提纯为精准的情报。
+        你是一个极度克制、追求“高价值密度”的 AI 行业资深参谋。你的前置同事已经为你提取了格式化的事实片段，你的任务是将这些片段升华、排版为适合钉钉阅读的每日情报。
 
-        # 审稿与去噪准则
-        1. 物理时效：今日 {today_full}。严禁处理发布时间早于 {yesterday_full} 的过时信息。
-        2. 拒绝注水：如果素材中没有量化指标，绝对禁止编造数字，直接跳过该板块。
-        3. 价值分级：
-        - 极度重要：独立成条，深度解析。
-        - 一般资讯：合并为“快讯速览”。
+        # 审稿与排版准则
+        1. 物理时效：今日 {today_full}。严禁展现发生早于 {yesterday_full} 的过时信息。
+        2. 价值分级与合并：
+           - 极度重要（行业巨头发布、技术重大突破）：独立成条，深度解析。
+           - 一般资讯（小额融资、常规更新）：合并为一个“快讯速览”专区。
+        3. 忠于原文：基于提供的核心功能点和数据指标，直接转化为排版语言，禁止编造素材里没有的 URL 或数据。
 
         # 钉钉排版标准
         1. 抬头：# 【AI 行业】情报汇总
-        2. 摘要：> {today_short} {weekday_str} | 核心态势：(一句话概括今日最重磅消息)
+        2. 摘要：> {today_short} {weekday_str} | 核心态势：(一句话概括今日资讯的整体核心)
 
-        3. 正文结构 (动态适配)：
-        ### [序号]. 【标题：品牌+核心事件】 (发布日期)
-        - 【核心动态】：一句话说明“发生了什么”。
-        - 【技术亮点】：说明“怎么做到的”或“有什么突破”。
-        - 【价值判断】：说明“对行业/开发者有什么影响”。
-        - 【关键参数/资源】：(可选) 仅在素材包含 Benchmark、链接、或者其他数据等等时列出。若无则不显示此项。
+        3. 正文结构要求：
+        ### [序号]. 【标题：品牌+核心事件】
+        - **核心动态**：(基于事件描述，一句话简明扼要)
+        - **事件详细**：基于事实清单的详细事件描述
+        - **技术/商业亮点**：(基于功能点，说明“有什么突破”或“影响”)
+        - **关键数据**：(仅在素材包含具体 Benchmark 或其他数据指标时列出，若无则跳过该行)
+        - **来源链接**：[查看原文](素材中的真实URL)
 
         # 任务开始
-        以下是经域名白名单过滤的洁净素材（来源已限定为官方实验室或权威媒体），请开始提纯：
+        以下是经提纯过滤的结构化事实清单（来源均可靠），请开始排版：
         <facts>
         {filtered_facts}
         </facts>
@@ -298,7 +376,7 @@ def handler():
         final_report = call_writer_llm(writer_prompt, API_KEY, APP_ID)
 
         print("---------------------------------------------------------\n\n")
-        print(final_report)
+        print("final_report: \n", final_report)
         print("---------------------------------------------------------\n\n")
 
         # C. 优化手机端展示（保留了你的呼吸感排版逻辑作为最终兜底）
