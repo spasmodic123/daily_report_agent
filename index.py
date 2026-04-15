@@ -1,4 +1,3 @@
-from sqlalchemy import false
 import requests
 import datetime
 import time
@@ -10,7 +9,7 @@ import re
 
 from setting import settings
 from source_filter import filter_sources
-
+from domain_config import DOMAINS, get_enabled_domains, UNIFIED_REPORT_PROMPT_TEMPLATE
 
 # ================= 1. 核心参数配置 =================
 API_KEY = settings.QWEN_API_KEY
@@ -27,72 +26,72 @@ tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 # =================================================
 
 
-def call_tavily_search(yesterday, today):
-    """Stage 1: Tavily 联网搜索（硬白名单约束）"""
-    # 官方 AI 实验室域名组
-    official_sites = [
-        "openai.com",
-        "anthropic.com",
-        "deepmind.google",
-        "blog.google",
-        "ai.meta.com",
-        "mistral.ai",
-        "blogs.nvidia.com",
-        "huggingface.co/blog",
-    ]
-    # 主流媒体域名组
-    media_sites = [
-        "theinformation.com",
-        "techcrunch.com",
-        "technologyreview.com",
-        "wired.com",
-        "reuters.com",
-        "36kr.com",
-        "aibase.cn",
-    ]
+def call_tavily_search_multi_domain(yesterday, today, enabled_domains):
+    """Stage 1: 多领域并发 Tavily 联网搜索"""
+    all_queries = []
 
-    queries = [
-        {
-            "q": f"{yesterday} AInews AI model announcement release",
-            "domains": official_sites,
-        },
-        {"q": f"{yesterday} AI news 人工智能", "domains": media_sites},
-    ]
+    for domain_id in enabled_domains:
+        domain_config = DOMAINS.get(domain_id)
+        if not domain_config:
+            continue
+
+        official_sites = domain_config["official_sites"]
+        media_sites = domain_config["media_sites"]
+
+        for query_config in domain_config["queries"]:
+            query_item = {
+                "domain_id": domain_id,
+                "q": query_config["q"],
+                "domains": (
+                    official_sites
+                    if query_config["type"] == "official"
+                    else media_sites
+                ),
+            }
+            all_queries.append(query_item)
 
     def _search(item):
         try:
-            return tavily_client.search(
-                query=item["q"],
-                include_domains=item["domains"],
-                max_results=8,
-                search_depth="advanced",
-                start_date=yesterday,
-                end_date=today,
-            ).get("results", [])
+            return {
+                "domain_id": item["domain_id"],
+                "results": tavily_client.search(
+                    query=item["q"],
+                    include_domains=item["domains"],
+                    max_results=5,
+                    search_depth="advanced",
+                    start_date=yesterday,
+                    end_date=today,
+                ).get("results", []),
+            }
         except Exception as e:
-            print(f"Tavily search error: {e}")
-            return []
+            print(f"Tavily search error for {item['domain_id']}: {e}")
+            return {"domain_id": item["domain_id"], "results": []}
 
-    all_results = []
+    # 并发执行所有查询
+    domain_results = {}
     with concurrent.futures.ThreadPoolExecutor() as pool:
-        for res in pool.map(_search, queries):
-            all_results.extend(res)
+        for res in pool.map(_search, all_queries):
+            domain_id = res["domain_id"]
+            if domain_id not in domain_results:
+                domain_results[domain_id] = []
+            domain_results[domain_id].extend(res["results"])
 
-    # 去重
-    seen_urls = set()
-    unique_results = []
-    for r in all_results:
-        url = r.get("url")
-        if url and url not in seen_urls:
-            seen_urls.add(url)
-            unique_results.append(r)
+    # 每个领域内去重并排序
+    for domain_id in domain_results:
+        seen_urls = set()
+        unique_results = []
+        for r in domain_results[domain_id]:
+            url = r.get("url")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_results.append(r)
+        unique_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        domain_results[domain_id] = unique_results
 
-    # 按 score 排序
-    unique_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-    return unique_results
+    return domain_results
 
 
-def call_tavily_extract(search_results, top_n=10):
+def call_tavily_extract(search_results, top_n=8):
     """Stage 2: Tavily 深度抓取正文（突破反爬）"""
     if not search_results:
         return []
@@ -100,31 +99,26 @@ def call_tavily_extract(search_results, top_n=10):
     urls = [r["url"] for r in search_results[:top_n]]
     try:
         resp = tavily_client.extract(urls=urls, extract_depth="advanced")
+        """
+        {
+            "results": [
+                {
+                    "url": "https://news.aibase.com/zh/news/27143",
+                    "title": "100B 匿名模型 Elephant 冲上 OpenRouter 趋势榜第二",
+                    "raw_content": "# 100B 匿名模型 Elephant 冲上 OpenRouter 趋势榜第二\n\n[![Image 1: AIBase](blob:http://localhost/64067b386f7258a8d203b80b0ead7a72)](https://www.aibase.com/)\n\n[首页](https://www.aibase.com/zh)\n\n[AI资讯](https://news.aibase.com/zh)\n\n[AI产品库](https://app.aibase.com/zh)\n\n[GEO平台](https://news.aibase.com/zh/news/27143)\n\n[MCP服务](https://mcp.aibase.com/zh)\n\n[模型算力广场](https://model.aibase.com/zh)\n\nZH\n\n登录/注册\n\n登录/注册\n\n[AI资讯](https://news.aibase.com/zh)\n\n[AI新闻资讯](https://news.aibase.com/zh/news)\n\n正文\n\n# 100B 匿名模型 Elephant 冲上 OpenRouter 趋势榜第二\n\n![Image 2: aibase](https://news.aibase.com/_nuxt/userlogo.q1jFctRw.png)\n\n发布于AI新闻资讯\n\n发布时间 :2026年4月15号 14:35\n\n阅读 :1 分钟\n\n4月15日，OpenRouter 数据显示，上线仅一天的匿名模型 Elephant Alpha 登上平台趋势榜（Trending）第2位、日榜(Today)第13名，token 使用量日增长377%。\n\n![Image 3: 862664070ee607688263bfb46af80fa9.png](https://upload.chinaz.com/2026/0415/6391186047781884333534301.png)\n\n![Image 4: 231407e92c3b7628dfd1e3336fdd441c.png](https://upload.chinaz.com/2026/0415/6391186049074233199195447.png)\n\nElephant拥有100B 参数量，支持256K 上下文输入及32K 输出。该模型在保持与同尺寸级别 SOTA 模型相当智能水平的前提下，提供了更快的响应速度与更低的资源占用。\n\n目前，社区对该匿名模型的猜测不一，可能是国产 最新 模型的 Flash 版本，或海外全新实验室出品。\n\n### 相关推荐\n\n[## 谷歌发布全新 Windows 桌面 AI 应用，轻松两键即可搜索！ 谷歌推出Windows版AI搜索应用，用户无需浏览器即可快速搜索。内置Gemini AI技术，按Alt+Space键即可呼出界面，输入问题获取即时结果。 2026年4月15号 13:53 114.3k](https://news.aibase.com/zh/news/27139)[## 谷歌DeepMind招了一位哲学家，这个信号比任何技术发布都值得关注 谷歌DeepMind首次在头部AI实验室设立全职哲学家岗位，聘请剑桥学者Henry Shevlin，研究方向聚焦机器意识、人机关系及人类对AGI的准备。他将深度参与实际研究，而非仅挂名顾问。 2026年4月15号 11:49 133.9k](https://news.aibase.com/zh/news/27137)[## ​天猫推出新规：规范 AI 软件及应用商品发布体验 天猫发布新规，要求商家在发布AI软件及应用类商品时，必须将其归类于指定目录，并确保产品信息真实透明。新规已于2026年4月14日正式生效，旨在提升消费者购物体验。 2026年4月15号 11:33 132.9k](https://news.aibase.com/zh/news/27135)[## OpenAI 投资者因 Anthropic 崛起而重新审视投资策略 《金融时报》报道称，OpenAI高达8520亿美元的估值正引发投资者质疑，主要因其面临Anthropic的激烈竞争。Anthropic年化收入从2025年底的90亿美元猛增至2026年3月的300亿美元，增长动力来自其编码工具需求强劲。有同时投资两家公司的投资者指出，OpenAI近期融资的合理性假设面临挑战。 2026年4月15号 10:42 149.8k](https://news.aibase.com/zh/news/27132)[## AI眼镜进入爆发期:千问旗舰款眼镜S1开售，苹果传明年上市 4月15日，千问AI眼镜S1正式开售，标志着AI眼镜市场进入爆发期。今年AI眼镜增速达智能眼镜整体市场的8倍，千问首款产品G1于3月上市即获超70%线上份额。Meta年出货近800万台，阿里等AI企业已占据市场第一梯队。华为、苹果虽传将入局，但尚未正式发布产品。 2026年4月15号 10:21 157.3k](https://news.aibase.com/zh/news/27129)\n\n![Image 5: AIBase](blob:http://localhost/64067b386f7258a8d203b80b0ead7a72)\n\n智启未来，您的人工智能解决方案智库\n\n[English](https://news.aibase.com/news/27143)[简体中文](https://news.aibase.com/zh/news/27143)[繁體中文](https://news.aibase.com/tw/news/27143)[にほんご](https://news.aibase.com/ja/news/27143)\n\n© 2026 AIBase",
+                    "images": []
+                },
+                ...
+            ],
+            "failed_results": [],
+            "response_time": 9.73,
+            "request_id": "77c01f4d-fbc4-465a-88fe-8a0179b912c7"
+        }
+        """
         return resp.get("results", [])
     except Exception as e:
         print(f"Tavily extract error: {e}")
         return []
-
-
-# def call_search_agent(prompt, api_key, app_id):
-#     """Stage 1: 调用百炼 Agent 仅进行联网搜索和事实提取"""
-#     url = f"https://dashscope.aliyuncs.com/api/v1/apps/{app_id}/completion"
-#     headers = {
-#         "Authorization": f"Bearer {api_key}",
-#         "Content-Type": "application/json",
-#     }
-#     data = {
-#         "input": {"prompt": prompt},
-#         "parameters": {
-#             "temperature": 0.5,  # 极低温度，确保不发散
-#             "top_p": 0.5,
-#             "enable_thinking": True,
-#         },
-#     }
-
-#     response = requests.post(url, headers=headers, json=data, timeout=300)
-#     response.raise_for_status()
-#     return response.json().get("output", {}).get("text", "")
 
 
 def call_writer_llm(prompt, api_key, app_id):
@@ -174,212 +168,194 @@ def handler():
     ]
     today_minute = now.strftime("%m-%d-%H:%M:%S")
 
-    print(f"=== 首席分析师启动: {today_full} {weekday_str} ===", flush=True)
+    print(f"=== 多领域资讯分析师启动: {today_full} {weekday_str} ===", flush=True)
+
+    # 获取启用的领域
+    enabled_domains = get_enabled_domains()
+    print(f"启用的领域: {[DOMAINS[d]['name'] for d in enabled_domains]}", flush=True)
 
     # ---------------------------------------------------------
-    # Stage 1: Tavily 联网搜索（白名单硬约束）
+    # Stage 1: 多领域并发 Tavily 联网搜索
     # ---------------------------------------------------------
-    print("--> 正在执行 Stage 1: Tavily 联网搜索...", flush=True)
-    search_results = call_tavily_search(yesterday_full, today_full)
-    print(f"  [Tavily Search] 找到 {len(search_results)} 条候选链接", flush=True)
+    print("--> 正在执行 Stage 1: 多领域 Tavily 联网搜索...", flush=True)
+    print(f"yesterday_full: {yesterday_full}", flush=True)
+    print(f"today_full: {today_full}", flush=True)
 
-    if not search_results:
-        return {"status": "error", "msg": "Tavily Search 未返回任何结果"}
+    domain_search_results = call_tavily_search_multi_domain(
+        yesterday_full, today_full, enabled_domains
+    )
 
-    # ---------------------------------------------------------
-    # Stage 2: Tavily 深度全文提取（突破反爬）
-    # ---------------------------------------------------------
-    print("--> 正在执行 Stage 2: Tavily 提取全文...", flush=True)
-    extracted_pages = call_tavily_extract(search_results, top_n=10)
-    print(f"  [Tavily Extract] 成功提取 {len(extracted_pages)} 个页面全文", flush=True)
+    for domain_id, results in domain_search_results.items():
+        print(
+            f"  [Tavily Search] {DOMAINS[domain_id]['name']}: 找到 {len(results)} 条候选链接",
+            flush=True,
+        )
 
-    if not extracted_pages:
-        return {"status": "error", "msg": "Tavily Extract 提取全文失败"}
-
-    # 将提取的页面组装成完整上下文(RAW)
-    pages_context = ""
-    for idx, page in enumerate(extracted_pages):
-        pages_context += f"【页面 {idx+1}】\nURL: {page.get('url')}\n正文内容：\n{page.get('raw_content', page.get('content', ''))}\n\n\n"
+    if not any(domain_search_results.values()):
+        return {"status": "error", "msg": "所有领域的 Tavily Search 均未返回结果"}
 
     # ---------------------------------------------------------
-    # Stage 2.5: 使用基础模型清洗页面内容噪声 (Base64, SVG, 导航栏等)
+    # Stage 2-4: 按领域处理（提取、清洗、提炼、过滤）
     # ---------------------------------------------------------
-    print("--> 正在执行 Stage 2.5: 大模型智能清洗页面噪声数据...", flush=True)
+    domain_filtered_facts = {}
 
-    def _clean_page(idx, page):
-        url = page.get("url")
-        raw_content = page.get("raw_content", page.get("content", ""))
+    for domain_id in enabled_domains:
+        search_results = domain_search_results.get(domain_id, [])
+        if not search_results:
+            print(f"[{DOMAINS[domain_id]['name']}] 无搜索结果，跳过", flush=True)
+            domain_filtered_facts[domain_id] = "今日暂无重大动态"
+            continue
 
-        # 兜底截断，防止单页面极大撑爆接口
-        if len(raw_content) > 40000:
-            raw_content = raw_content[:40000] + "\n...(因过长截断)"
+        print(
+            f"\n--> 正在处理领域: {DOMAINS[domain_id]['name']} ({domain_id})",
+            flush=True,
+        )
 
-        # 使用兼容 OpenAI 接口调用廉价基础模型，例如 qwen-plus
-        clean_prompt = f"任务：清理以下网页的垃圾噪声。去除所有长篇幅的 base64 编码图片、无用 svg/html 样式代码、页脚导航栏等干扰。\n只保留真正有用的新闻报道正文、技术说明、引述等纯文本内容。\n请直接输出清理后的干净正文，不要输出多余格式或者前置提示：\n\n{raw_content}"
+        # Stage 2: Tavily 深度全文提取
+        print(f"  [Stage 2] 提取全文...", flush=True)
+        extracted_pages = call_tavily_extract(search_results, top_n=10)
+        print(
+            f"  domain {DOMAINS[domain_id]['name']} ,成功提取 {len(extracted_pages)} 个页面全文",
+            flush=True,
+        )
 
-        api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
-        }
-        data = {
-            "model": "qwen3.5-flash",
-            "messages": [{"role": "user", "content": clean_prompt}],
-            "temperature": 0.5,
-        }
+        if not extracted_pages:
+            print(f"  [{DOMAINS[domain_id]['name']}] 提取失败，跳过", flush=True)
+            domain_filtered_facts[domain_id] = "今日暂无重大动态"
+            continue
+
+        # Stage 2.5: LLM 清洗页面噪声
+        print(f"  [Stage 2.5] 清洗页面噪声...", flush=True)
+
+        def _clean_page(idx, page):
+            url = page.get("url")
+            raw_content = page.get("raw_content", page.get("content", ""))
+
+            if len(raw_content) > 40000:
+                raw_content = raw_content[:40000] + "\n...(因过长截断)"
+
+            clean_prompt = f"""任务：清理以下网页的垃圾噪声。去除所有长篇幅的 base64 编码图片、无用 svg/html 样式代码、页脚导航栏等干扰。
+            \n只保留真正有用的新闻报道正文、技术说明、引述等纯文本内容。\n请直接输出清理后的干净正文，不要输出多余格式或者前置提示：\n\n{raw_content}"""
+
+            api_url = (
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+            )
+            headers = {
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json",
+            }
+            data = {
+                "model": "qwen3.5-flash",
+                "messages": [{"role": "user", "content": clean_prompt}],
+                "temperature": 0.5,
+            }
+
+            try:
+                resp = requests.post(api_url, headers=headers, json=data, timeout=120)
+                resp.raise_for_status()
+                cleaned_content = (
+                    resp.json()
+                    .get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+                if not cleaned_content.strip():
+                    cleaned_content = raw_content
+            except Exception as e:
+                print(f"  [警告] 页面 {idx+1} 清洗失败: {e}", flush=True)
+                cleaned_content = raw_content
+
+            return f"【页面 {idx+1}】\nURL: {url}\n正文内容（已清洗）：\n{cleaned_content}\n\n\n"
+
+        cleaned_pages_context_list = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            results = pool.map(
+                lambda enum: _clean_page(enum[0], enum[1]), enumerate(extracted_pages)
+            )
+            cleaned_pages_context_list = list(results)
+
+        cleaned_pages_context = "".join(cleaned_pages_context_list)
+
+        # 保存调试文件
+        try:
+            with open(
+                f"extract_result/{domain_id}_cleaned_{today_minute}.txt",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write(cleaned_pages_context)
+        except Exception as e:
+            print(f"  [Debug] 保存 {domain_id} 清洗结果失败: {e}", flush=True)
+
+        # Stage 3: 领域定制化提炼
+        print(f"  [Stage 3] 结构化提炼...", flush=True)
+        domain_config = DOMAINS[domain_id]
+        extract_prompt = domain_config["extraction_prompt_template"].format(
+            yesterday=yesterday_full,
+            today=today_full,
+            cleaned_pages_context=cleaned_pages_context,
+        )
 
         try:
-            resp = requests.post(api_url, headers=headers, json=data, timeout=120)
-            resp.raise_for_status()
-            cleaned_content = (
-                resp.json()
-                .get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
-            if not cleaned_content.strip():
-                cleaned_content = raw_content
-        except Exception as e:
-            print(f"  [警告] 页面 {idx+1} 清洗失败: {e}", flush=True)
-            cleaned_content = raw_content
+            raw_facts = call_writer_llm(extract_prompt, API_KEY, APP_ID)
+            if not raw_facts:
+                print(f"  [{DOMAINS[domain_id]['name']}] LLM 提炼返回为空", flush=True)
+                domain_filtered_facts[domain_id] = "今日暂无重大动态"
+                continue
 
-        return f"【页面 {idx+1}】\nURL: {url}\n正文内容（已清洗）：\n{cleaned_content}\n\n\n"
+            # Stage 4: 域名白名单过滤
+            print(f"  [Stage 4] 域名白名单过滤...", flush=True)
+            filtered_facts, filter_stats = filter_sources(raw_facts)
 
-    # 并发执行清洗
-    cleaned_pages_context_list = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-        # 保持顺序
-        results = pool.map(
-            lambda enum: _clean_page(enum[0], enum[1]), enumerate(extracted_pages)
-        )
-        cleaned_pages_context_list = list(results)
-
-    cleaned_pages_context = "".join(cleaned_pages_context_list)
-
-    # 将清洗前与清洗后的结果分别保存到本地以便调试查看对比
-    try:
-        with open(
-            f"extract_result/extracted_pages_debug_raw_{today_minute}.txt",
-            "w",
-            encoding="utf-8",
-        ) as f:
-            f.write(pages_context)
-        with open(
-            f"extract_result/extracted_pages_debug_cleaned_{today_minute}.txt",
-            "w",
-            encoding="utf-8",
-        ) as f:
-            f.write(cleaned_pages_context)
-        print(
-            f"  [Debug] 页面抓取与清洗结果已对比保存至 extract_result/extracted_pages_debug_raw/cleaned_{today_minute}.txt",
-            flush=True,
-        )
-    except Exception as e:
-        print(f"  [Debug] 保存抓取结果失败: {e}", flush=True)
-
-    # ---------------------------------------------------------
-    # Stage 3: Qwen 结构化提炼 (精读全文)
-    # ---------------------------------------------------------
-    extract_prompt = f"""
-    任务：详细阅读以下网页全文内容，提炼 {yesterday_full} 至 {today_full} 期间全球 AI 行业重大动态事实。
-
-    网页全文内容如下：
-    <pages>
-    {cleaned_pages_context}
-    </pages>
-
-    请对网页信息提取核心事实部分，每一条资讯的输出格式（严格遵循）：
-    - 事件名称：
-    - 事件描述：（基于页面正文内容，详细描述发生了什么）
-    - 发布/发生日期：
-    - 核心功能点：
-    - 官方数据指标：（若正文无数据请写"未提及"）
-    - 来源 URL：（必填，使用页面原本的 URL）
-
-    规则：
-    1. 你是一个无情的资料提取机器，直接提取资料不要进行任何加工。
-    2. 绝对诚实：没有找到的维度请直接写"未提及"，严禁编造任何数据。
-    3. 如果多个页面讲同一件事，请合并提取为一条资讯。
-    """
-
-    try:
-        print("--> 正在执行 Stage 3: Qwen 结构化提炼...", flush=True)
-        raw_facts = call_writer_llm(extract_prompt, API_KEY, APP_ID)
-
-        print("---------------------------------------------------------\n\n")
-        print("raw_facts: \n", raw_facts)
-        print("---------------------------------------------------------\n\n")
-
-        if not raw_facts:
-            return {"status": "error", "msg": "LLM 提炼返回为空"}
-
-        # ---------------------------------------------------------
-        # Stage 4: Python 域名白名单硬过滤（安全冗余约束）
-        # ---------------------------------------------------------
-        print("--> 正在执行 Stage 4: 域名白名单过滤...", flush=True)
-        filtered_facts, filter_stats = filter_sources(raw_facts)
-
-        print(
-            f"  [过滤统计] 总段落: {filter_stats['total']} | "
-            f"保留: {filter_stats['kept']} | "
-            f"剔除: {filter_stats['removed']} | "
-            f"无URL段落: {filter_stats['no_url']}",
-            flush=True,
-        )
-        if filter_stats["removed_domains"]:
-            print(f"  [剔除域名] {filter_stats['removed_domains']}", flush=True)
-
-        # 回退保护：若过滤后内容为空，降级使用原始素材并打印警告
-        if not filtered_facts or not filtered_facts.strip():
             print(
-                "  WARNING: 过滤后内容为空！回退使用原始搜索结果（可能包含低质量来源）",
+                f"  [过滤统计] 总段落: {filter_stats['total']} | "
+                f"保留: {filter_stats['kept']} | "
+                f"剔除: {filter_stats['removed']}",
                 flush=True,
             )
-            filtered_facts = raw_facts
 
-        # ---------------------------------------------------------
-        # Stage 5: 审稿模式 (严格校验事实，执行排版)
-        #   ★ 输入素材已经过域名白名单过滤，来源均为官方/主流媒体
-        # ---------------------------------------------------------
+            if not filtered_facts or not filtered_facts.strip():
+                print(
+                    f"  WARNING: {DOMAINS[domain_id]['name']} 过滤后内容为空！回退使用原始搜索结果（可能包含低质量来源）",
+                    flush=True,
+                )
+                filtered_facts = raw_facts
 
-        writer_prompt = f"""
-        # Role
-        你是一个极度克制、追求“高价值密度”的 AI 行业资深参谋。你的前置同事已经为你提取了格式化的事实片段，你的任务是将这些片段升华、排版为适合钉钉阅读的每日情报。
+            domain_filtered_facts[domain_id] = filtered_facts
 
-        # 审稿与排版准则
-        1. 物理时效：今日 {today_full}。严禁展现发生早于 {yesterday_full} 的过时信息。
-        2. 价值分级与合并：
-           - 极度重要（行业巨头发布、技术重大突破）：独立成条，深度解析。
-           - 一般资讯（小额融资、常规更新）：合并为一个“快讯速览”专区。
-        3. 忠于原文：基于提供的核心功能点和数据指标，直接转化为排版语言，禁止编造素材里没有的 URL 或数据。
+        except Exception as e:
+            print(f"  [{DOMAINS[domain_id]['name']}] 处理失败: {e}", flush=True)
+            domain_filtered_facts[domain_id] = "今日暂无重大动态"
 
-        # 钉钉排版标准
-        1. 抬头：# 【AI 行业】情报汇总
-        2. 摘要：> {today_short} {weekday_str} | 核心态势：(一句话概括今日资讯的整体核心)
+        except Exception as e:
+            print(f"  [{DOMAINS[domain_id]['name']}] 处理失败: {e}", flush=True)
+            domain_filtered_facts[domain_id] = "今日暂无重大动态"
 
-        3. 正文结构要求：
-        ### [序号]. 【标题：品牌+核心事件】
-        - **核心动态**：(基于事件描述，一句话简明扼要)
-        - **事件详细**：基于事实清单的详细事件描述
-        - **技术/商业亮点**：(基于功能点，说明“有什么突破”或“影响”)
-        - **关键数据**：(仅在素材包含具体 Benchmark 或其他数据指标时列出，若无则跳过该行)
-        - **来源链接**：[查看原文](素材中的真实URL)
+    # ---------------------------------------------------------
+    # Stage 5: 统一报告排版与推送
+    # ---------------------------------------------------------
+    print("\n--> 正在执行 Stage 5: 统一报告排版...", flush=True)
 
-        # 任务开始
-        以下是经提纯过滤的结构化事实清单（来源均可靠），请开始排版：
-        <facts>
-        {filtered_facts}
-        </facts>
-        """
+    try:
+        writer_prompt = UNIFIED_REPORT_PROMPT_TEMPLATE.format(
+            today_full=today_full,
+            yesterday_full=yesterday_full,
+            today_short=today_short,
+            weekday_str=weekday_str,
+            ai_facts=domain_filtered_facts.get("ai", "今日暂无重大动态"),
+            finance_facts=domain_filtered_facts.get("finance", "今日暂无重大动态"),
+            healthcare_facts=domain_filtered_facts.get(
+                "healthcare", "今日暂无重大动态"
+            ),
+        )
 
-        print("--> 正在执行 Stage 5: 事实校验与深度排版...", flush=True)
         final_report = call_writer_llm(writer_prompt, API_KEY, APP_ID)
 
         print("---------------------------------------------------------\n\n")
         print("final_report: \n", final_report)
         print("---------------------------------------------------------\n\n")
 
-        # C. 优化手机端展示（保留了你的呼吸感排版逻辑作为最终兜底）
+        # 优化手机端展示
         lines = [l.strip() for l in final_report.split("\n") if l.strip()]
         formatted_text = ""
         for l in lines:
@@ -398,7 +374,10 @@ def handler():
 
         print("-> 正在推送至钉钉...", flush=True)
         push_res = push_to_dingtalk(
-            formatted_text, f"AI 日报 {today_short}", DING_ACCESS_TOKEN, DING_SECRET
+            formatted_text,
+            f"综合资讯日报 {today_short}",
+            DING_ACCESS_TOKEN,
+            DING_SECRET,
         )
         print(f"🚀 钉钉推送状态: {push_res}")
 

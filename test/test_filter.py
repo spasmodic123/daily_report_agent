@@ -4,8 +4,15 @@ test_filter.py — source_filter 单元测试脚本
 """
 
 import sys
+import os
 
-sys.path.insert(0, "/Users/wuboxiong/Desktop/learn/daily_report_agent")
+script_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.dirname(script_dir)
+if root_dir not in sys.path:
+    sys.path.append(root_dir)
+src_dir = os.path.join(root_dir, "src")
+if src_dir not in sys.path:
+    sys.path.append(src_dir)
 
 from source_filter import get_domain_score, filter_sources
 

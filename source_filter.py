@@ -15,7 +15,6 @@ source_filter.py — 域名白名单硬过滤器
 import re
 from urllib.parse import urlparse
 
-
 # ===========================================================
 # 1. 白名单域名（官方/主流媒体，带质量权重）
 # ===========================================================
@@ -53,6 +52,41 @@ WHITELIST_DOMAINS: dict[str, int] = {
     # ---- 国内媒体（次级，仍可信） ----
     "zhihu.com": 6,
     "toutiao.com": 6,
+    "aibase.cn": 7,
+    "36kr.com": 6,
+    # ---- 财经领域官方机构 ----
+    "imf.org": 10,
+    "worldbank.org": 10,
+    "federalreserve.gov": 10,
+    "ecb.europa.eu": 10,
+    "pbc.gov.cn": 10,
+    "csrc.gov.cn": 10,
+    "sse.com.cn": 9,
+    "szse.cn": 9,
+    # ---- 财经媒体 ----
+    "caixin.com": 8,
+    "yicai.com": 8,
+    "cls.cn": 7,
+    "eastmoney.com": 6,
+    "finance.sina.com.cn": 6,
+    # ---- 医疗健康官方机构 ----
+    "who.int": 10,
+    "nih.gov": 10,
+    "fda.gov": 10,
+    "cdc.gov": 10,
+    "nature.com": 10,
+    "nejm.org": 10,
+    "thelancet.com": 10,
+    "nhc.gov.cn": 10,
+    "nmpa.gov.cn": 10,
+    "chinacdc.cn": 9,
+    # ---- 医疗健康媒体 ----
+    "statnews.com": 8,
+    "medpagetoday.com": 7,
+    "dxy.cn": 7,
+    "cn-healthcare.com": 7,
+    "yxj.org.cn": 7,
+    "bioon.com": 6,
 }
 
 # ===========================================================
