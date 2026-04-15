@@ -6,6 +6,44 @@ import hashlib
 import base64
 import urllib.parse
 import re
+import json
+import os
+
+
+# ================= Stage I/O Helpers =================
+def _ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def save_stage_json(folder, filename, data):
+    _ensure_dir(folder)
+    with open(os.path.join(folder, filename), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def save_stage_text(folder, filename, text):
+    _ensure_dir(folder)
+    with open(os.path.join(folder, filename), "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def load_stage_json(folder, filename):
+    path = os.path.join(folder, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"[Resume] 找不到文件: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_stage_text(folder, filename):
+    path = os.path.join(folder, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"[Resume] 找不到文件: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+# =====================================================
 
 from setting import settings
 from source_filter import filter_sources
@@ -57,7 +95,7 @@ def call_tavily_search_multi_domain(yesterday, today, enabled_domains):
                 "results": tavily_client.search(
                     query=item["q"],
                     include_domains=item["domains"],
-                    max_results=5,
+                    max_results=3,
                     search_depth="advanced",
                     start_date=yesterday,
                     end_date=today,
@@ -133,7 +171,7 @@ def call_writer_llm(prompt, api_key, app_id):
         "parameters": {"temperature": 0.5, "top_p": 0.5, "enable_thinking": False},
     }
 
-    response = requests.post(url, headers=headers, json=data, timeout=120)
+    response = requests.post(url, headers=headers, json=data, timeout=360)
     response.raise_for_status()
     return response.json().get("output", {}).get("text", "")
     # return response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -157,7 +195,7 @@ def push_to_dingtalk(text, title, access_token, secret):
     return res.text
 
 
-def handler():
+def handler(resume_config=None):
     # 动态日期锚点：适配北京时间
     now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
     today_full = now.strftime("%Y-%m-%d")
@@ -167,6 +205,22 @@ def handler():
         now.weekday()
     ]
     today_minute = now.strftime("%m-%d-%H:%M:%S")
+
+    # Debug / Resume 配置
+    start_from = 1
+    end_at = 5
+    resume_ts = today_minute
+
+    if resume_config:
+        start_from = resume_config.get("start_from", 1)
+        end_at = resume_config.get("end_at", 5)
+        resume_ts = resume_config.get("timestamp") or today_minute
+        print(
+            f"[Debug] Stage {start_from} → {end_at}，加载时间戳: {resume_ts}",
+            flush=True,
+        )
+
+    ts = today_minute  # 本次运行保存文件用的时间戳
 
     print(f"=== 多领域资讯分析师启动: {today_full} {weekday_str} ===", flush=True)
 
@@ -181,15 +235,32 @@ def handler():
     print(f"yesterday_full: {yesterday_full}", flush=True)
     print(f"today_full: {today_full}", flush=True)
 
-    domain_search_results = call_tavily_search_multi_domain(
-        yesterday_full, today_full, enabled_domains
-    )
-
-    for domain_id, results in domain_search_results.items():
-        print(
-            f"  [Tavily Search] {DOMAINS[domain_id]['name']}: 找到 {len(results)} 条候选链接",
-            flush=True,
+    if start_from <= 1 <= end_at:
+        domain_search_results = call_tavily_search_multi_domain(
+            yesterday_full, today_full, enabled_domains
         )
+        for domain_id, results in domain_search_results.items():
+            save_stage_json("stage1_search", f"{domain_id}_search_{ts}.json", results)
+            print(
+                f"  [Tavily Search] {DOMAINS[domain_id]['name']}: 找到 {len(results)} 条候选链接",
+                flush=True,
+            )
+        print(f"  [Saved] stage1_search/", flush=True)
+    else:
+        print(f"  [Resume] 加载 Stage 1 结果 (ts={resume_ts})...", flush=True)
+        domain_search_results = {}
+        for d in enabled_domains:
+            domain_search_results[d] = load_stage_json(
+                "stage1_search", f"{d}_search_{resume_ts}.json"
+            )
+            print(
+                f"  [Loaded] {DOMAINS[d]['name']}: {len(domain_search_results[d])} 条",
+                flush=True,
+            )
+
+    if end_at < 2:
+        print("[Debug] end_at=1，已完成 Stage 1，退出。", flush=True)
+        return {"status": "debug_exit", "stage": 1}
 
     if not any(domain_search_results.values()):
         return {"status": "error", "msg": "所有领域的 Tavily Search 均未返回结果"}
@@ -200,8 +271,9 @@ def handler():
     domain_filtered_facts = {}
 
     for domain_id in enabled_domains:
+        # 讲一个domain全部处理完再处理下一个stage
         search_results = domain_search_results.get(domain_id, [])
-        if not search_results:
+        if not search_results and start_from <= 2:
             print(f"[{DOMAINS[domain_id]['name']}] 无搜索结果，跳过", flush=True)
             domain_filtered_facts[domain_id] = "今日暂无重大动态"
             continue
@@ -211,121 +283,166 @@ def handler():
             flush=True,
         )
 
-        # Stage 2: Tavily 深度全文提取
-        print(f"  [Stage 2] 提取全文...", flush=True)
-        extracted_pages = call_tavily_extract(search_results, top_n=10)
-        print(
-            f"  domain {DOMAINS[domain_id]['name']} ,成功提取 {len(extracted_pages)} 个页面全文",
-            flush=True,
-        )
+        # Stage 2A: Tavily 深度全文提取
+        if start_from <= 2 <= end_at:
+            print(f"  [Stage 2A] 提取全文...", flush=True)
+            extracted_pages = call_tavily_extract(search_results, top_n=10)
+            print(
+                f"  domain {DOMAINS[domain_id]['name']} ,成功提取 {len(extracted_pages)} 个页面全文",
+                flush=True,
+            )
+            save_stage_json(
+                "stage2a_extract", f"{domain_id}_extract_{ts}.json", extracted_pages
+            )
 
-        if not extracted_pages:
-            print(f"  [{DOMAINS[domain_id]['name']}] 提取失败，跳过", flush=True)
-            domain_filtered_facts[domain_id] = "今日暂无重大动态"
-            continue
+            if not extracted_pages:
+                print(f"  [{DOMAINS[domain_id]['name']}] 提取失败，跳过", flush=True)
+                domain_filtered_facts[domain_id] = "今日暂无重大动态"
+                continue
+        elif start_from > 2:
+            print(f"  [Resume] 加载 Stage 2A 结果 (ts={resume_ts})...", flush=True)
+            extracted_pages = load_stage_json(
+                "stage2a_extract", f"{domain_id}_extract_{resume_ts}.json"
+            )
+            print(f"  [Loaded] {len(extracted_pages)} 个页面", flush=True)
 
-        # Stage 2.5: LLM 清洗页面噪声
-        print(f"  [Stage 2.5] 清洗页面噪声...", flush=True)
+        # Stage 2B: LLM 清洗页面噪声
+        if start_from <= 2 <= end_at:
+            print(f"  [Stage 2B] 清洗页面噪声...", flush=True)
 
-        def _clean_page(idx, page):
-            url = page.get("url")
-            raw_content = page.get("raw_content", page.get("content", ""))
+            def _clean_page(idx, page):
+                url = page.get("url")
+                raw_content = page.get("raw_content", page.get("content", ""))
 
-            if len(raw_content) > 40000:
-                raw_content = raw_content[:40000] + "\n...(因过长截断)"
+                if len(raw_content) > 40000:
+                    raw_content = raw_content[:40000] + "\n...(因过长截断)"
 
-            clean_prompt = f"""任务：清理以下网页的垃圾噪声。去除所有长篇幅的 base64 编码图片、无用 svg/html 样式代码、页脚导航栏等干扰。
+                clean_prompt = f"""任务：清理以下网页的垃圾噪声。去除所有长篇幅的 base64 编码图片、无用 svg/html 样式代码、页脚导航栏等干扰。
             \n只保留真正有用的新闻报道正文、技术说明、引述等纯文本内容。\n请直接输出清理后的干净正文，不要输出多余格式或者前置提示：\n\n{raw_content}"""
 
-            api_url = (
-                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-            )
-            headers = {
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json",
-            }
-            data = {
-                "model": "qwen3.5-flash",
-                "messages": [{"role": "user", "content": clean_prompt}],
-                "temperature": 0.5,
-            }
+                api_url = (
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+                )
+                headers = {
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json",
+                }
+                data = {
+                    "model": "qwen3.5-flash",
+                    "messages": [{"role": "user", "content": clean_prompt}],
+                    "temperature": 0.5,
+                }
+
+                try:
+                    resp = requests.post(
+                        api_url, headers=headers, json=data, timeout=360
+                    )
+                    resp.raise_for_status()
+                    cleaned_content = (
+                        resp.json()
+                        .get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                    )
+                    if not cleaned_content.strip():
+                        cleaned_content = raw_content
+                except Exception as e:
+                    print(f"  [警告] 页面 {idx+1} 清洗失败: {e}", flush=True)
+                    cleaned_content = raw_content
+
+                return f"【页面 {idx+1}】\nURL: {url}\n正文内容（已清洗）：\n{cleaned_content}\n\n\n"
+
+            cleaned_pages_context_list = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+                results = pool.map(
+                    lambda enum: _clean_page(enum[0], enum[1]),
+                    enumerate(extracted_pages),
+                )
+                cleaned_pages_context_list = list(results)
+
+            cleaned_pages_context = "".join(cleaned_pages_context_list)
 
             try:
-                resp = requests.post(api_url, headers=headers, json=data, timeout=120)
-                resp.raise_for_status()
-                cleaned_content = (
-                    resp.json()
-                    .get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
+                save_stage_text(
+                    "stage2b_cleaned",
+                    f"{domain_id}_cleaned_{ts}.txt",
+                    cleaned_pages_context,
                 )
-                if not cleaned_content.strip():
-                    cleaned_content = raw_content
             except Exception as e:
-                print(f"  [警告] 页面 {idx+1} 清洗失败: {e}", flush=True)
-                cleaned_content = raw_content
+                print(f"  [Debug] 保存 {domain_id} 清洗结果失败: {e}", flush=True)
 
-            return f"【页面 {idx+1}】\nURL: {url}\n正文内容（已清洗）：\n{cleaned_content}\n\n\n"
-
-        cleaned_pages_context_list = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-            results = pool.map(
-                lambda enum: _clean_page(enum[0], enum[1]), enumerate(extracted_pages)
+        elif start_from > 2:
+            print(f"  [Resume] 加载 Stage 2B 结果 (ts={resume_ts})...", flush=True)
+            cleaned_pages_context = load_stage_text(
+                "stage2b_cleaned", f"{domain_id}_cleaned_{resume_ts}.txt"
             )
-            cleaned_pages_context_list = list(results)
 
-        cleaned_pages_context = "".join(cleaned_pages_context_list)
-
-        # 保存调试文件
-        try:
-            with open(
-                f"extract_result/{domain_id}_cleaned_{today_minute}.txt",
-                "w",
-                encoding="utf-8",
-            ) as f:
-                f.write(cleaned_pages_context)
-        except Exception as e:
-            print(f"  [Debug] 保存 {domain_id} 清洗结果失败: {e}", flush=True)
+        if end_at < 3:
+            print(
+                f"  [Debug] end_at=2，已完成 Stage 2B for {domain_id}，跳过后续。",
+                flush=True,
+            )
+            continue
 
         # Stage 3: 领域定制化提炼
-        print(f"  [Stage 3] 结构化提炼...", flush=True)
-        domain_config = DOMAINS[domain_id]
-        extract_prompt = domain_config["extraction_prompt_template"].format(
-            yesterday=yesterday_full,
-            today=today_full,
-            cleaned_pages_context=cleaned_pages_context,
-        )
-
         try:
-            raw_facts = call_writer_llm(extract_prompt, API_KEY, APP_ID)
-            if not raw_facts:
-                print(f"  [{DOMAINS[domain_id]['name']}] LLM 提炼返回为空", flush=True)
-                domain_filtered_facts[domain_id] = "今日暂无重大动态"
+            if start_from <= 3 <= end_at:
+                print(f"  [Stage 3] 结构化提炼...", flush=True)
+                domain_config = DOMAINS[domain_id]
+                extract_prompt = domain_config["extraction_prompt_template"].format(
+                    yesterday=yesterday_full,
+                    today=today_full,
+                    cleaned_pages_context=cleaned_pages_context,
+                )
+                raw_facts = call_writer_llm(extract_prompt, API_KEY, APP_ID)
+                if not raw_facts:
+                    print(
+                        f"  [{DOMAINS[domain_id]['name']}] LLM 提炼返回为空", flush=True
+                    )
+                    domain_filtered_facts[domain_id] = "今日暂无重大动态"
+                    continue
+                save_stage_text(
+                    "stage3_facts", f"{domain_id}_facts_{ts}.txt", raw_facts
+                )
+            else:
+                print(f"  [Resume] 加载 Stage 3 结果 (ts={resume_ts})...", flush=True)
+                raw_facts = load_stage_text(
+                    "stage3_facts", f"{domain_id}_facts_{resume_ts}.txt"
+                )
+
+            if end_at < 4:
+                print(
+                    f"  [Debug] end_at=3，已完成 Stage 3 for {domain_id}，跳过后续。",
+                    flush=True,
+                )
                 continue
 
             # Stage 4: 域名白名单过滤
-            print(f"  [Stage 4] 域名白名单过滤...", flush=True)
-            filtered_facts, filter_stats = filter_sources(raw_facts)
-
-            print(
-                f"  [过滤统计] 总段落: {filter_stats['total']} | "
-                f"保留: {filter_stats['kept']} | "
-                f"剔除: {filter_stats['removed']}",
-                flush=True,
-            )
-
-            if not filtered_facts or not filtered_facts.strip():
+            if start_from <= 4 <= end_at:
+                print(f"  [Stage 4] 域名白名单过滤...", flush=True)
+                filtered_facts, filter_stats = filter_sources(raw_facts)
                 print(
-                    f"  WARNING: {DOMAINS[domain_id]['name']} 过滤后内容为空！回退使用原始搜索结果（可能包含低质量来源）",
+                    f"  [过滤统计] 总段落: {filter_stats['total']} | "
+                    f"保留: {filter_stats['kept']} | "
+                    f"剔除: {filter_stats['removed']}",
                     flush=True,
                 )
-                filtered_facts = raw_facts
+                if not filtered_facts or not filtered_facts.strip():
+                    print(
+                        f"  WARNING: {DOMAINS[domain_id]['name']} 过滤后内容为空！回退使用原始搜索结果（可能包含低质量来源）",
+                        flush=True,
+                    )
+                    filtered_facts = raw_facts
+                save_stage_text(
+                    "stage4_filtered", f"{domain_id}_filtered_{ts}.txt", filtered_facts
+                )
+            else:
+                print(f"  [Resume] 加载 Stage 4 结果 (ts={resume_ts})...", flush=True)
+                filtered_facts = load_stage_text(
+                    "stage4_filtered", f"{domain_id}_filtered_{resume_ts}.txt"
+                )
 
             domain_filtered_facts[domain_id] = filtered_facts
-
-        except Exception as e:
-            print(f"  [{DOMAINS[domain_id]['name']}] 处理失败: {e}", flush=True)
-            domain_filtered_facts[domain_id] = "今日暂无重大动态"
 
         except Exception as e:
             print(f"  [{DOMAINS[domain_id]['name']}] 处理失败: {e}", flush=True)
@@ -335,6 +452,10 @@ def handler():
     # Stage 5: 统一报告排版与推送
     # ---------------------------------------------------------
     print("\n--> 正在执行 Stage 5: 统一报告排版...", flush=True)
+
+    if end_at < 5:
+        print("[Debug] end_at < 5，跳过 Stage 5（不推送钉钉）", flush=True)
+        return {"status": "debug_exit", "stage": end_at}
 
     try:
         writer_prompt = UNIFIED_REPORT_PROMPT_TEMPLATE.format(
@@ -350,6 +471,8 @@ def handler():
         )
 
         final_report = call_writer_llm(writer_prompt, API_KEY, APP_ID)
+
+        save_stage_text("stage5_report", f"report_{ts}.md", final_report)
 
         print("---------------------------------------------------------\n\n")
         print("final_report: \n", final_report)
@@ -388,4 +511,11 @@ def handler():
         return {"status": "error", "msg": str(e)}
 
 
-handler()
+if __name__ == "__main__":
+    _start = int(os.environ.get("RESUME_FROM_STAGE", "1") or "1")
+    _end = int(os.environ.get("END_AT_STAGE", "5") or "5")
+    _ts = os.environ.get("RESUME_TIMESTAMP", "").strip() or None
+    if _start > 1 or _end < 5:
+        handler(resume_config={"start_from": _start, "end_at": _end, "timestamp": _ts})
+    else:
+        handler()
