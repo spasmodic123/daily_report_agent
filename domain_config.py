@@ -17,28 +17,9 @@ DOMAINS = {
     "ai": {
         "name": "AI行业",
         "icon": "🤖",
-        "queries": [
-            {"q": "AI model announcement release", "type": "official"},
-            {"q": "AI news 人工智能", "type": "media"},
-        ],
-        "official_sites": [
-            "openai.com",
-            "anthropic.com",
-            "deepmind.google",
-            "blog.google",
-            "ai.meta.com",
-            "mistral.ai",
-            "blogs.nvidia.com",
-            "huggingface.co",
-        ],
-        "media_sites": [
-            "aibase.cn",
-            "36kr.com",
-            "theinformation.com",
-            "techcrunch.com",
-            "technologyreview.com",
-            "wired.com",
-            "reuters.com",
+        "news_index_urls": [
+            "https://news.aibase.cn/news",
+            # "https://techcrunch.com/",
         ],
         "extraction_focus": "AI模型发布、技术突破、融资动态、Benchmark数据",
         "extraction_prompt_template": """任务：详细阅读以下网页全文内容，提炼 {yesterday} 至 {today} 期间全球 AI 行业重大动态事实。
@@ -60,38 +41,21 @@ DOMAINS = {
 1. 你是一个无情的资料提取机器，直接提取资料不要进行任何加工。
 2. 绝对诚实：没有找到的维度请直接写"未提及"，严禁编造任何数据。
 3. 如果多个页面讲同一件事，请合并提取为一条资讯。
+4. 【日期过滤 - 最高优先级】：每条资讯必须先判断其发布/发生日期。若日期明确且早于 {yesterday} 或晚于 {today}，直接跳过该条，不输出任何内容。若页面中完全找不到日期信息，保留该条但在发布/发生日期字段注明"日期不明"。
 """,
     },
     "finance": {
         "name": "财经",
         "icon": "💰",
-        "queries": [
-            {"q": "stock market news financial policy", "type": "official"},
-            {"q": "金融政策 股市 IPO merger acquisition", "type": "media"},
-        ],
-        "official_sites": [
-            "imf.org",
-            "worldbank.org",
-            "federalreserve.gov",
-            "ecb.europa.eu",
-            "pbc.gov.cn",
-            "csrc.gov.cn",
-            "sse.com.cn",
-            "szse.cn",
-        ],
-        "media_sites": [
-            "bloomberg.com",
-            "reuters.com",
-            "ft.com",
-            "wsj.com",
-            "cnbc.com",
-            "caixin.com",
-            "yicai.com",
-            "cls.cn",
-            "eastmoney.com",
+        "news_index_urls": [
+            "https://www.cnbc.com/finance/",
+            # "https://www.cnbc.com/economy/",
+            # "https://www.yicai.com",
+            # "https://www.cls.cn",
+            # "https://www.caixin.com",
         ],
         "extraction_focus": "股市波动、金融政策、企业财报、并购IPO、宏观经济数据",
-        "extraction_prompt_template": """任务：详细阅读以下网页全文内容，提炼 {yesterday} 至 {today} 期间全球财经重大动态事实。
+        "extraction_prompt_template": """任务：详细阅读以下网页全文内容，提炼 {yesterday} 至 {today} 期间全球财经动态事实。
 
 网页全文内容如下：
 <pages>
@@ -117,42 +81,19 @@ DOMAINS = {
 1. 你是一个无情的资料提取机器，直接提取资料不要进行任何加工。
 2. 绝对诚实：没有找到的维度请直接写"未提及"，严禁编造任何数据。
 3. 如果多个页面讲同一件事，请合并提取为一条资讯。
+4. 【日期过滤 - 最高优先级】：每条资讯必须先判断其发布/发生日期。若日期明确且早于 {yesterday} 或晚于 {today}，直接跳过该条，不输出任何内容。若页面中完全找不到日期信息，保留该条但在发布/发生日期字段注明"日期不明"。
 """,
     },
     "healthcare": {
         "name": "医疗健康",
         "icon": "🏥",
-        "queries": [
-            {
-                "q": "medical breakthrough clinical trial drug approval",
-                "type": "official",
-            },
-            {"q": "医学突破 临床试验 新药获批 公共卫生", "type": "media"},
-        ],
-        "official_sites": [
-            "who.int",
-            "nih.gov",
-            "fda.gov",
-            "cdc.gov",
-            "nature.com",
-            "nejm.org",
-            "thelancet.com",
-            "nhc.gov.cn",
-            "nmpa.gov.cn",
-            "chinacdc.cn",
-        ],
-        "media_sites": [
-            "reuters.com",
-            "bloomberg.com",
-            "statnews.com",
-            "medpagetoday.com",
-            "dxy.cn",
-            "cn-healthcare.com",
-            "yxj.org.cn",
-            "bioon.com",
+        "news_index_urls": [
+            "https://news.bioon.com",
+            # "https://www.dxy.cn",
+            # "https://www.jkb.com.cn",
         ],
         "extraction_focus": "医学突破、临床试验、新药获批、公共卫生事件、医疗器械创新",
-        "extraction_prompt_template": """任务：详细阅读以下网页全文内容，提炼 {yesterday} 至 {today} 期间全球医疗健康重大动态事实。
+        "extraction_prompt_template": """任务：详细阅读以下网页全文内容，提炼 {yesterday} 至 {today} 期间全球医疗健康动态事实。
 
 网页全文内容如下：
 <pages>
@@ -178,6 +119,7 @@ DOMAINS = {
 1. 你是一个无情的资料提取机器，直接提取资料不要进行任何加工。
 2. 绝对诚实：没有找到的维度请直接写"未提及"，严禁编造任何数据。
 3. 如果多个页面讲同一件事，请合并提取为一条资讯。
+4. 【日期过滤 - 最高优先级】：每条资讯必须先判断其发布/发生日期。若日期明确且早于 {yesterday} 或晚于 {today}，直接跳过该条，不输出任何内容。若页面中完全找不到日期信息，保留该条但在发布/发生日期字段注明"日期不明"。
 """,
     },
 }

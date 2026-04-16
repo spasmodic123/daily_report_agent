@@ -153,67 +153,120 @@ tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 # =================================================
 
 
-def call_tavily_search_multi_domain(yesterday, today, enabled_domains):
-    """Stage 1: 多领域并发 Tavily 联网搜索"""
-    all_queries = []
+def extract_article_links(enabled_domains):
+    """Stage 1: 直接 Extract 各领域新闻列表页，提取文章链接。
 
+    返回: dict[domain_id → list[{"url": str}]]
+    """
+    from urllib.parse import urlparse
+
+    def _is_article_url(url):
+        """判断 URL 是否为具体文章（路径 ≥ 2 段）"""
+        path = urlparse(url).path.rstrip("/")
+        segments = [s for s in path.split("/") if s]
+        return len(segments) >= 2
+
+    def _get_root_domain(url):
+        """提取根域名（去掉 www 等前缀），用于同域判断"""
+        host = urlparse(url).netloc.lower()
+        # www.cnbc.com → cnbc.com, news.bioon.com → bioon.com
+        parts = host.split(".")
+        if len(parts) >= 2:
+            return ".".join(parts[-2:])
+        return host
+
+    # 收集所有需要 extract 的列表页 URL，记录归属哪个 domain
+    url_to_domains: dict[str, list[str]] = {}
     for domain_id in enabled_domains:
         domain_config = DOMAINS.get(domain_id)
         if not domain_config:
             continue
+        for index_url in domain_config.get("news_index_urls", []):
+            url_to_domains.setdefault(index_url, []).append(domain_id)
 
-        official_sites = domain_config["official_sites"]
-        media_sites = domain_config["media_sites"]
+    all_index_urls = list(url_to_domains.keys())
+    if not all_index_urls:
+        return {}
 
-        for query_config in domain_config["queries"]:
-            query_item = {
-                "domain_id": domain_id,
-                "q": query_config["q"],
-                "domains": (
-                    official_sites
-                    if query_config["type"] == "official"
-                    else media_sites
-                ),
-            }
-            all_queries.append(query_item)
+    print(f"  正在 Extract {len(all_index_urls)} 个新闻列表页...", flush=True)
 
-    def _search(item):
-        try:
-            return {
-                "domain_id": item["domain_id"],
-                "results": tavily_client.search(
-                    query=item["q"],
-                    include_domains=item["domains"],
-                    max_results=3,
-                    search_depth="advanced",
-                    start_date=yesterday,
-                    end_date=today,
-                ).get("results", []),
-            }
-        except Exception as e:
-            print(f"Tavily search error for {item['domain_id']}: {e}")
-            return {"domain_id": item["domain_id"], "results": []}
+    MAX_ARTICLES_PER_PAGE = 4  # 每个列表页最多提取的文章数
 
-    # 并发执行所有查询
-    domain_results = {}
-    with concurrent.futures.ThreadPoolExecutor() as pool:
-        for res in pool.map(_search, all_queries):
-            domain_id = res["domain_id"]
-            if domain_id not in domain_results:
-                domain_results[domain_id] = []
-            domain_results[domain_id].extend(res["results"])
+    # 批量 Extract
+    domain_results: dict[str, list[dict]] = {d: [] for d in enabled_domains}
+    try:
+        resp = tavily_client.extract(urls=all_index_urls, extract_depth="advanced")
+        for item in resp.get("results", []):
+            src_url = item.get("url", "")
+            rc = item.get("raw_content", "")
+            src_root_domain = _get_root_domain(src_url)
 
-    # 每个领域内去重并排序
+            # 从 raw_content 提取所有 markdown 链接
+            all_links = re.findall(r"\]\((https?://[^\)\s]{10,300})\)", rc)
+            # 去重 + 过滤
+            seen = set()
+            article_links = []
+            for link in all_links:
+                if link in seen:
+                    continue
+                seen.add(link)
+                if not _is_article_url(link):
+                    continue
+                # 只保留同域名的链接（排除外部链接）
+                if _get_root_domain(link) != src_root_domain:
+                    continue
+                if any(
+                    x in link
+                    for x in [
+                        "login",
+                        "register",
+                        "mailto:",
+                        "javascript:",
+                        ".png",
+                        ".jpg",
+                        ".svg",
+                        ".css",
+                        ".js",
+                        "/database/",
+                        "/meeting/",
+                        "/interviews/",
+                        "/search",
+                        "/tag/",
+                        "/category/",
+                        "/topic/",
+                        "/about",
+                        "/contact",
+                        "/privacy",
+                        "/terms",
+                    ]
+                ):
+                    continue
+                article_links.append(link)
+                if len(article_links) >= MAX_ARTICLES_PER_PAGE:
+                    break
+
+            # 归到对应的 domain
+            for domain_id in url_to_domains.get(src_url, []):
+                for link in article_links:
+                    domain_results[domain_id].append({"url": link})
+
+            print(
+                f"    {src_url[:60]} → {len(article_links)} 篇文章链接",
+                flush=True,
+            )
+    except Exception as e:
+        print(f"  [Stage 1] Extract 列表页失败: {e}", flush=True)
+        return domain_results
+
+    # 每个领域内去重
     for domain_id in domain_results:
         seen_urls = set()
-        unique_results = []
+        deduped = []
         for r in domain_results[domain_id]:
-            url = r.get("url")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                unique_results.append(r)
-        unique_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-        domain_results[domain_id] = unique_results
+            if r["url"] not in seen_urls:
+                seen_urls.add(r["url"])
+                deduped.append(r)
+        domain_results[domain_id] = deduped
 
     return domain_results
 
@@ -318,20 +371,16 @@ def handler(resume_config=None):
     print(f"启用的领域: {[DOMAINS[d]['name'] for d in enabled_domains]}", flush=True)
 
     # ---------------------------------------------------------
-    # Stage 1: 多领域并发 Tavily 联网搜索
+    # Stage 1: Extract 新闻列表页，提取文章链接
     # ---------------------------------------------------------
-    print("--> 正在执行 Stage 1: 多领域 Tavily 联网搜索...", flush=True)
-    print(f"yesterday_full: {yesterday_full}", flush=True)
-    print(f"today_full: {today_full}", flush=True)
+    print("--> 正在执行 Stage 1: Extract 新闻列表页...", flush=True)
 
     if start_from <= 1 <= end_at:
-        domain_search_results = call_tavily_search_multi_domain(
-            yesterday_full, today_full, enabled_domains
-        )
+        domain_search_results = extract_article_links(enabled_domains)
         for domain_id, results in domain_search_results.items():
             save_stage_json("stage1_search", f"{domain_id}_search_{ts}.json", results)
             print(
-                f"  [Tavily Search] {DOMAINS[domain_id]['name']}: 找到 {len(results)} 条候选链接",
+                f"  {DOMAINS[domain_id]['name']}: 提取到 {len(results)} 篇文章链接",
                 flush=True,
             )
         print(f"  [Saved] stage1_search/", flush=True)
@@ -352,7 +401,7 @@ def handler(resume_config=None):
         return {"status": "debug_exit", "stage": 1}
 
     if not any(domain_search_results.values()):
-        return {"status": "error", "msg": "所有领域的 Tavily Search 均未返回结果"}
+        return {"status": "error", "msg": "所有领域的列表页均未提取到文章链接"}
 
     # ---------------------------------------------------------
     # Stage 2-4: 按领域处理（提取、清洗、提炼、过滤）
