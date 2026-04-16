@@ -43,6 +43,95 @@ def load_stage_text(folder, filename):
         return f.read()
 
 
+# ================= URL噪声预过滤 =================
+def prefilter_raw_content(raw_content: str) -> str:
+    """
+    在发给LLM清洗之前，用规则先去除明显的噪声：
+    - 纯图片行、裸URL行：直接删除
+    - 高密度链接区块（导航栏/目录）：用滑动窗口检测，整块折叠为占位符
+    """
+    lines = raw_content.split("\n")
+
+    # 纯 markdown 链接行（含列表/标题前缀）
+    nav_link_re = re.compile(
+        r"^(\s*[\*\-#]+\s*)?\[.{0,80}\]\(https?://[^\)]{1,300}\)\s*$"
+    )
+    img_re = re.compile(r"^\s*!\[.*?\]\(.*?\)")
+    bare_url_re = re.compile(r"^\s*https?://\S+\s*$")
+
+    # 标记每行是否为"链接噪声行"
+    is_link = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            is_link.append(False)
+        elif img_re.match(s) or bare_url_re.match(s) or nav_link_re.match(s):
+            is_link.append(True)
+        else:
+            is_link.append(False)
+
+    # 滑动窗口检测高密度链接区块
+    WINDOW = 7
+    THRESHOLD = 0.65
+    n = len(lines)
+    in_nav_block = [False] * n
+    for i in range(n - WINDOW + 1):
+        window_links = sum(1 for j in range(i, i + WINDOW) if is_link[j])
+        window_nonempty = sum(1 for j in range(i, i + WINDOW) if lines[j].strip())
+        if window_nonempty > 0 and window_links / window_nonempty >= THRESHOLD:
+            for j in range(i, i + WINDOW):
+                in_nav_block[j] = True
+
+    # 生成中间结果（None=空行，'__NAV__'=导航链接行，其余保留）
+    result = []
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            result.append(None)
+            continue
+        if img_re.match(s) or bare_url_re.match(s):
+            continue  # 直接删除
+        if in_nav_block[i] and is_link[i]:
+            result.append("__NAV__")
+        else:
+            result.append(line)
+
+    # 合并连续 __NAV__ 块为单个占位符
+    cleaned = []
+    i = 0
+    while i < len(result):
+        item = result[i]
+        if item == "__NAV__" or (
+            item is None and i + 1 < len(result) and result[i + 1] == "__NAV__"
+        ):
+            j = i
+            has_nav = False
+            while j < len(result) and (result[j] == "__NAV__" or result[j] is None):
+                if result[j] == "__NAV__":
+                    has_nav = True
+                j += 1
+            if has_nav:
+                cleaned += ["", "[...导航/目录链接已省略...]", ""]
+            i = j
+        else:
+            cleaned.append("" if item is None else item)
+            i += 1
+
+    # 清理多余空行
+    final = []
+    prev_empty = False
+    for line in cleaned:
+        if not line:
+            if not prev_empty:
+                final.append(line)
+            prev_empty = True
+        else:
+            prev_empty = False
+            final.append(line)
+
+    return "\n".join(final)
+
+
 # =====================================================
 
 from setting import settings
@@ -313,6 +402,9 @@ def handler(resume_config=None):
             def _clean_page(idx, page):
                 url = page.get("url")
                 raw_content = page.get("raw_content", page.get("content", ""))
+
+                # 规则预过滤：去除导航栏/图片/裸URL等噪声，降低发给LLM的token量
+                raw_content = prefilter_raw_content(raw_content)
 
                 if len(raw_content) > 40000:
                     raw_content = raw_content[:40000] + "\n...(因过长截断)"
