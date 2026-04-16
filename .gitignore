@@ -2,3 +2,13 @@
 /1.json
 /1.py
 /__pycache__
+/stage1_search
+/stage2a_extract
+/stage2b_cleaned
+/stage3_facts
+/stage4_filtered
+/stage5_report
+/docs/钉钉日报机器人开发记录.md
+/docs/1.json
+/docs/1.py
+/.vscode/
