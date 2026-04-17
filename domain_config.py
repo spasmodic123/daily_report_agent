@@ -17,6 +17,10 @@ DOMAINS = {
     "ai": {
         "name": "AI行业",
         "icon": "🤖",
+        "rss_urls": [
+            # 填入有 RSS feed 的权威媒体 URL，优先使用（时序最准确）
+            # "https://techcrunch.com/category/artificial-intelligence/feed/",
+        ],
         "news_index_urls": [
             "https://news.aibase.cn/news",
             # "https://techcrunch.com/",
@@ -47,6 +51,10 @@ DOMAINS = {
     "finance": {
         "name": "财经",
         "icon": "💰",
+        "rss_urls": [
+            # CNBC 有官方 RSS，但需在真实环境验证可达性
+            # "https://www.cnbc.com/id/10000664/device/rss/rss.html",
+        ],
         "news_index_urls": [
             "https://www.cnbc.com/finance/",
             # "https://www.cnbc.com/economy/",
@@ -87,6 +95,9 @@ DOMAINS = {
     "healthcare": {
         "name": "医疗健康",
         "icon": "🏥",
+        "rss_urls": [
+            # 填入有 RSS feed 的权威医疗媒体 URL
+        ],
         "news_index_urls": [
             "https://news.bioon.com",
             # "https://www.dxy.cn",

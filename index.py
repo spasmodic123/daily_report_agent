@@ -154,10 +154,12 @@ tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
 
 def extract_article_links(enabled_domains):
-    """Stage 1: 直接 Extract 各领域新闻列表页，提取文章链接。
+    """Stage 1: 提取各领域文章链接。
 
+    策略：RSS feed 优先（时序最准确）→ Jina Reader 兜底（JS 渲染，绕过缓存）
     返回: dict[domain_id → list[{"url": str}]]
     """
+    import feedparser
     from urllib.parse import urlparse
 
     def _is_article_url(url):
@@ -171,103 +173,111 @@ def extract_article_links(enabled_domains):
         host = urlparse(url).netloc.lower()
         # www.cnbc.com → cnbc.com, news.bioon.com → bioon.com
         parts = host.split(".")
-        if len(parts) >= 2:
-            return ".".join(parts[-2:])
-        return host
+        return ".".join(parts[-2:]) if len(parts) >= 2 else host
 
-    # 收集所有需要 extract 的列表页 URL，记录归属哪个 domain
-    url_to_domains: dict[str, list[str]] = {}
-    for domain_id in enabled_domains:
-        domain_config = DOMAINS.get(domain_id)
-        if not domain_config:
-            continue
-        for index_url in domain_config.get("news_index_urls", []):
-            url_to_domains.setdefault(index_url, []).append(domain_id)
+    # 首页的URL如果包含以下的路径，说明大概率不是文章URL，可能是导航栏或者图片等等的URL
+    _URL_NOISE = [
+        "login",
+        "register",
+        "mailto:",
+        "javascript:",
+        ".png",
+        ".jpg",
+        ".svg",
+        ".css",
+        ".js",
+        "/database/",
+        "/meeting/",
+        "/interviews/",
+        "/search",
+        "/tag/",
+        "/category/",
+        "/topic/",
+        "/about",
+        "/contact",
+        "/privacy",
+        "/terms",
+    ]
 
-    all_index_urls = list(url_to_domains.keys())
-    if not all_index_urls:
-        return {}
+    def _filter_links(links, src_root_domain, max_n):
+        seen = set()
+        result = []
+        for link in links:
+            if link in seen:
+                continue
+            seen.add(link)
+            if not _is_article_url(link):
+                continue
+            if _get_root_domain(link) != src_root_domain:
+                continue
+            if any(x in link for x in _URL_NOISE):
+                continue
+            result.append(link)
+            if len(result) >= max_n:
+                break
+        return result
 
-    print(f"  正在 Extract {len(all_index_urls)} 个新闻列表页...", flush=True)
+    def _fetch_rss(rss_url, max_n):
+        """解析 RSS/Atom feed，返回文章 URL 列表（已按发布时间倒序）。"""
+        feed = feedparser.parse(rss_url)
+        links = [e.get("link", "") for e in feed.entries if e.get("link")]
+        return [{"url": u} for u in links[:max_n] if u]
 
-    MAX_ARTICLES_PER_PAGE = 4  # 每个列表页最多提取的文章数
+    def _fetch_jina(index_url, max_n):
+        """用 Jina Reader 渲染 JS 页面，提取同域文章链接。"""
+        jina_url = f"https://r.jina.ai/{index_url}"
+        headers = {
+            "Accept": "text/plain",
+            "X-Return-Format": "markdown",
+            "X-No-Cache": "true",  # 强制跳过 Jina CDN 缓存，获取实时内容
+            "X-Timeout": "20",
+        }
+        resp = requests.get(jina_url, headers=headers, timeout=25)
+        resp.raise_for_status()
+        rc = resp.text
+        src_root = _get_root_domain(index_url)
+        raw_links = re.findall(r"\]\((https?://[^\)\s]{10,300})\)", rc)
+        filtered = _filter_links(raw_links, src_root, max_n)
+        return [{"url": u} for u in filtered]
 
-    # 批量 Extract
+    # 每个列表页最多提取的文章数
+    MAX_PER_SOURCE = 4
+
     domain_results: dict[str, list[dict]] = {d: [] for d in enabled_domains}
-    try:
-        resp = tavily_client.extract(urls=all_index_urls, extract_depth="advanced")
-        for item in resp.get("results", []):
-            src_url = item.get("url", "")
-            rc = item.get("raw_content", "")
-            src_root_domain = _get_root_domain(src_url)
 
-            # 从 raw_content 提取所有 markdown 链接
-            all_links = re.findall(r"\]\((https?://[^\)\s]{10,300})\)", rc)
-            # 去重 + 过滤
-            seen = set()
-            article_links = []
-            for link in all_links:
-                if link in seen:
-                    continue
-                seen.add(link)
-                if not _is_article_url(link):
-                    continue
-                # 只保留同域名的链接（排除外部链接）
-                if _get_root_domain(link) != src_root_domain:
-                    continue
-                if any(
-                    x in link
-                    for x in [
-                        "login",
-                        "register",
-                        "mailto:",
-                        "javascript:",
-                        ".png",
-                        ".jpg",
-                        ".svg",
-                        ".css",
-                        ".js",
-                        "/database/",
-                        "/meeting/",
-                        "/interviews/",
-                        "/search",
-                        "/tag/",
-                        "/category/",
-                        "/topic/",
-                        "/about",
-                        "/contact",
-                        "/privacy",
-                        "/terms",
-                    ]
-                ):
-                    continue
-                article_links.append(link)
-                if len(article_links) >= MAX_ARTICLES_PER_PAGE:
-                    break
+    for domain_id in enabled_domains:
+        cfg = DOMAINS.get(domain_id)
+        if not cfg:
+            continue
 
-            # 归到对应的 domain
-            for domain_id in url_to_domains.get(src_url, []):
-                for link in article_links:
-                    domain_results[domain_id].append({"url": link})
+        seen_urls: set[str] = set()
 
-            print(
-                f"    {src_url[:60]} → {len(article_links)} 篇文章链接",
-                flush=True,
-            )
-    except Exception as e:
-        print(f"  [Stage 1] Extract 列表页失败: {e}", flush=True)
-        return domain_results
+        def _add(articles):
+            for a in articles:
+                if a["url"] not in seen_urls:
+                    seen_urls.add(a["url"])
+                    domain_results[domain_id].append(a)
 
-    # 每个领域内去重
-    for domain_id in domain_results:
-        seen_urls = set()
-        deduped = []
-        for r in domain_results[domain_id]:
-            if r["url"] not in seen_urls:
-                seen_urls.add(r["url"])
-                deduped.append(r)
-        domain_results[domain_id] = deduped
+        # ── 1. RSS（时序最准）────────────────────────────────
+        for rss_url in cfg.get("rss_urls", []):
+            try:
+                arts = _fetch_rss(rss_url, MAX_PER_SOURCE)
+                _add(arts)
+                print(f"    [RSS]  {rss_url[:70]} → {len(arts)} 篇", flush=True)
+            except Exception as e:
+                print(f"    [RSS]  {rss_url[:70]} 失败: {e}", flush=True)
 
+        # ── 2. Jina Reader（JS 渲染，绕缓存）────────────────
+        for index_url in cfg.get("news_index_urls", []):
+            try:
+                arts = _fetch_jina(index_url, MAX_PER_SOURCE)
+                _add(arts)
+                print(f"    [Jina] {index_url[:70]} → {len(arts)} 篇", flush=True)
+            except Exception as e:
+                print(f"    [Jina] {index_url[:70]} 失败: {e}", flush=True)
+
+    total = sum(len(v) for v in domain_results.values())
+    print(f"  Stage 1 完成，共 {total} 篇文章链接", flush=True)
     return domain_results
 
 
